@@ -1,278 +1,179 @@
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 import logging
-import requests
-from typing import List, Dict, Any, Optional
-# from googletrans import Translator as GoogleTranslator
-import asyncio
-import edge_tts
-import os
+import gc
 
 logger = logging.getLogger(__name__)
 
-# 尝试导入OpenAI，如果不可用则使用基础翻译
-try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-    logger.warning("OpenAI库未安装，将使用基础翻译功能")
-
-class Translator:
-    def __init__(self, service: str = "google", api_key: str = "", use_reflection: bool = False):
-        """
-        初始化翻译器
+class NeuralTranslator:
+    def __init__(self, nmt_model_id="facebook/nllb-200-distilled-600M", reflection_model_id=None, device='cpu'):
+        self.device = device
+        self.nmt_model_id = nmt_model_id
         
-        Args:
-            service: 翻译服务 (google, openai)
-            api_key: API密钥（如果需要）
-            use_reflection: 是否使用翻译-反思-翻译方法（需要OpenAI）
-        """
-        self.service = service
-        self.api_key = api_key or os.getenv('OPENAI_API_KEY', '')
-        self.use_reflection = use_reflection and OPENAI_AVAILABLE
-        
-        # 初始化OpenAI客户端
-        if self.use_reflection and self.api_key:
-            try:
-                self.openai_client = OpenAI(api_key=self.api_key)
-                logger.info("OpenAI翻译反思模式已启用")
-            except Exception as e:
-                logger.warning(f"OpenAI初始化失败: {e}，将使用基础翻译")
-                self.use_reflection = False
-        else:
-            self.openai_client = None
-        
-    def translate_text(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
-        """
-        翻译文本
-        
-        Args:
-            text: 要翻译的文本
-            target_lang: 目标语言代码
-            source_lang: 源语言代码
-            
-        Returns:
-            翻译后的文本
-        """
+        logger.info(f"正在加载 NMT 模型: {nmt_model_id} (Device: {device})")
         try:
-            # 如果启用了反思模式，使用翻译-反思-翻译方法
-            if self.use_reflection:
-                return self._translate_with_reflection(text, target_lang, source_lang)
+            # 1. 加载翻译模型 (NLLB)
+            self.nmt_tokenizer = AutoTokenizer.from_pretrained(nmt_model_id)
+            self.nmt_model = AutoModelForSeq2SeqLM.from_pretrained(nmt_model_id)
             
-            # 否则使用基础翻译
-            if self.service == "google":
-                return self._translate_google(text, target_lang, source_lang)
-            elif self.service == "openai":
-                return self._translate_openai(text, target_lang, source_lang)
-            else:
-                raise ValueError(f"不支持的翻译服务: {self.service}")
+            if device == 'cuda':
+                self.nmt_model = self.nmt_model.to(device)
+            
+            # 2. 加载反思模型 (可选)
+            self.reflector = None
+            if reflection_model_id:
+                logger.info(f"正在加载反思模型: {reflection_model_id}")
+                try:
+                    # 使用 pipeline 简化 LLM 推理
+                    # device_map="auto" 会自动处理内存
+                    self.reflector = pipeline(
+                        "text-generation", 
+                        model=reflection_model_id,
+                        device=0 if device == 'cuda' else -1,
+                        torch_dtype=torch.float16 if device == 'cuda' else torch.float32,
+                        model_kwargs={"low_cpu_mem_usage": True}
+                    )
+                    logger.info("反思模型加载成功")
+                except Exception as e:
+                    logger.warning(f"反思模型加载失败，将降级为仅翻译模式: {e}")
+                    self.reflector = None
                 
         except Exception as e:
-            logger.error(f"文本翻译失败: {e}")
-            raise Exception(f"翻译失败: {e}")
-    
-    def _translate_google(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
-        """使用Google翻译API"""
-        try:
-            # 使用Google Translate API
-            url = "https://translate.googleapis.com/translate_a/single"
-            params = {
-                'client': 'gtx',
-                'sl': source_lang if source_lang != 'auto' else 'auto',
-                'tl': target_lang,
-                'dt': 't',
-                'q': text
-            }
-            
-            response = requests.get(url, params=params)
-            response.raise_for_status()
-            
-            result = response.json()
-            translated_text = ''.join([item[0] for item in result[0]])
-            return translated_text
-            
-        except Exception as e:
-            logger.error(f"Google翻译失败: {e}")
-            # 如果API失败，返回原文
-            return text
-    
-    def _translate_openai(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
-        """使用OpenAI进行翻译"""
-        try:
-            lang_map = {
-                'zh': '中文', 'zh-cn': '简体中文', 'zh-tw': '繁体中文',
-                'en': 'English', 'ja': '日本語', 'ko': '한국어',
-                'fr': 'Français', 'de': 'Deutsch', 'es': 'Español',
-                'ru': 'Русский', 'ar': 'العربية', 'pt': 'Português'
-            }
-            target_language = lang_map.get(target_lang, target_lang)
-            
-            prompt = f"""请将以下文本翻译成{target_language}。
-要求：
-1. 保持原文的语气和风格
-2. 确保翻译自然流畅
-3. 只返回翻译结果，不要添加任何解释
+            logger.error(f"核心模型加载失败: {e}")
+            raise e
 
-原文：
-{text}"""
-            
-            response = self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except Exception as e:
-            logger.error(f"OpenAI翻译失败: {e}")
-            return text
-    
-    def _translate_with_reflection(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
-        """使用翻译-反思-翻译方法提升翻译质量"""
-        try:
-            lang_map = {
-                'zh': '中文', 'zh-cn': '简体中文', 'zh-tw': '繁体中文',
-                'en': 'English', 'ja': '日本語', 'ko': '한국어',
-                'fr': 'Français', 'de': 'Deutsch', 'es': 'Español',
-                'ru': 'Русский', 'ar': 'العربية', 'pt': 'Português'
-            }
-            target_language = lang_map.get(target_lang, target_lang)
-            source_language = lang_map.get(source_lang, '原语言') if source_lang != 'auto' else '原语言'
-            
-            # 第一步：初始翻译
-            logger.info("步骤1/3: 初始翻译...")
-            initial_prompt = f"""请将以下{source_language}文本翻译成{target_language}。
-要求：
-1. 准确传达原文含义
-2. 保持原文的语气和风格
-3. 确保翻译自然流畅
-4. 只返回翻译结果，不要添加任何解释或标记
-
-原文：
-{text}"""
-            
-            initial_response = self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": initial_prompt}],
-                temperature=0.3
-            )
-            initial_translation = initial_response.choices[0].message.content.strip()
-            
-            # 第二步：反思和改进建议
-            logger.info("步骤2/3: 反思分析...")
-            reflection_prompt = f"""作为一位专业的翻译评审专家，请评估以下翻译的质量，并提供改进建议。
-
-原文（{source_language}）：
-{text}
-
-当前翻译（{target_language}）：
-{initial_translation}
-
-请分析：
-1. 翻译的准确性（是否准确传达原文含义）
-2. 语言的流畅性（是否符合目标语言的表达习惯）
-3. 专业术语的处理（如有）
-4. 语气和风格的保持
-5. 可能存在的错误或不当之处
-
-请提供具体的改进建议，说明哪些地方可以优化。"""
-            
-            reflection_response = self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": reflection_prompt}],
-                temperature=0.5
-            )
-            reflection = reflection_response.choices[0].message.content.strip()
-            logger.debug(f"反思结果: {reflection}")
-            
-            # 第三步：基于反思改进翻译
-            logger.info("步骤3/3: 改进翻译...")
-            improvement_prompt = f"""基于以下反思和建议，请提供改进后的翻译版本。
-
-原文（{source_language}）：
-{text}
-
-初始翻译（{target_language}）：
-{initial_translation}
-
-反思和改进建议：
-{reflection}
-
-请提供改进后的最终翻译，只返回翻译结果，不要添加任何解释或标记。"""
-            
-            final_response = self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": improvement_prompt}],
-                temperature=0.3
-            )
-            final_translation = final_response.choices[0].message.content.strip()
-            
-            logger.info("翻译-反思-翻译流程完成")
-            return final_translation
-            
-        except Exception as e:
-            logger.error(f"反思翻译失败: {e}，回退到基础翻译")
-            # 如果反思翻译失败，回退到基础翻译
-            return self._translate_google(text, target_lang, source_lang)
-    
-    def translate_segments(self, segments: List[Dict[str, Any]], 
-                          target_lang: str, source_lang: str = "auto") -> List[Dict[str, Any]]:
+    def _translate_batch(self, texts, src_lang_code, tgt_lang_code):
         """
-        翻译字幕段落
+        执行批量翻译
+        """
+        # NLLB 语言代码映射表 (简化版，覆盖常见语言)
+        # 完整列表见 NLLB 文档
+        lang_map = {
+            'en': 'eng_Latn', 
+            'zh': 'zho_Hans', 'zh-cn': 'zho_Hans',
+            'ja': 'jpn_Jpan', 
+            'ko': 'kor_Hang',
+            'fr': 'fra_Latn',
+            'de': 'deu_Latn',
+            'auto': 'eng_Latn' # 默认
+        }
         
-        Args:
-            segments: 字幕段落列表
-            target_lang: 目标语言
-            source_lang: 源语言
+        # 获取 NLLB 特定的语言代码
+        tgt_code = lang_map.get(tgt_lang_code, 'eng_Latn')
+        src_code = lang_map.get(src_lang_code, 'eng_Latn')
+
+        # 1. Tokenize
+        inputs = self.nmt_tokenizer(
+            texts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=128
+        )
+        
+        if self.device == 'cuda':
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        # 2. Generate (Inference)
+        # forced_bos_token_id 告诉模型翻译成什么语言
+        forced_bos_token_id = self.nmt_tokenizer.convert_tokens_to_ids(tgt_code)
+        
+        with torch.no_grad():
+            generated_tokens = self.nmt_model.generate(
+                **inputs, 
+                forced_bos_token_id=forced_bos_token_id,
+                max_length=128,
+                num_beams=4, # 使用 Beam Search 提升质量
+                early_stopping=True
+            )
+
+        # 3. Decode
+        translations = self.nmt_tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+        
+        # 清理显存
+        if self.device == 'cuda':
+            del inputs, generated_tokens
+            torch.cuda.empty_cache()
             
-        Returns:
-            翻译后的字幕段落
+        return translations
+
+    def _reflect_and_improve(self, source_text, initial_translation, tgt_lang):
+        """
+        Agent 逻辑: 翻译 - 反思 - 改进
+        """
+        if not self.reflector:
+            return initial_translation
+
+        # 构建 Prompt (针对小模型优化)
+        prompt = (
+            f"Task: Correct the translation.\n"
+            f"Original: {source_text}\n"
+            f"Draft: {initial_translation}\n"
+            f"Corrected: "
+        )
+        
+        try:
+            # LLM 推理
+            response = self.reflector(
+                prompt, 
+                max_new_tokens=64, 
+                do_sample=False, # 确定性输出
+                num_return_sequences=1,
+                pad_token_id=self.reflector.tokenizer.eos_token_id
+            )[0]['generated_text']
+            
+            # 提取结果 (截取 Corrected: 之后的部分)
+            improved = response.split("Corrected:")[-1].strip()
+            
+            # 简单的质量控制：如果生成结果太短或为空，回退
+            if len(improved) < 2:
+                return initial_translation
+                
+            return improved
+        except Exception as e:
+            logger.warning(f"反思步骤出错: {e}")
+            return initial_translation
+
+    def translate_segments(self, segments, target_lang, source_lang='auto', use_reflection=False):
+        """
+        处理字幕片段列表
         """
         translated_segments = []
+        batch_size = 8 # 根据显存大小调整
         
-        try:
-            for segment in segments:
-                translated_text = self.translate_text(
-                    segment["text"], 
-                    target_lang, 
-                    source_lang
-                )
-                
-                translated_segment = segment.copy()
-                translated_segment["text"] = translated_text
-                translated_segments.append(translated_segment)
-                
-            logger.info(f"翻译完成: {len(segments)} 个段落")
-            return translated_segments
+        # 提取所有文本
+        all_texts = [seg['text'] for seg in segments]
+        
+        # 批量翻译
+        logger.info(f"开始批量翻译 {len(all_texts)} 条字幕...")
+        final_translations = []
+        
+        for i in range(0, len(all_texts), batch_size):
+            batch_texts = all_texts[i:i+batch_size]
+            # Step 1: NMT 翻译
+            batch_results = self._translate_batch(batch_texts, source_lang, target_lang)
+            final_translations.extend(batch_results)
             
-        except Exception as e:
-            logger.error(f"字幕翻译失败: {e}")
-            raise Exception(f"字幕翻译失败: {e}")
-    
-    def get_supported_languages(self) -> Dict[str, str]:
-        """获取支持的语言列表"""
-        if self.service == "google":
-            return {
-                'auto': '自动检测',
-                'zh-cn': '中文（简体）',
-                'zh-tw': '中文（繁体）',
-                'en': '英语',
-                'ja': '日语',
-                'ko': '韩语',
-                'fr': '法语',
-                'de': '德语',
-                'es': '西班牙语',
-                'ru': '俄语',
-                'ar': '阿拉伯语',
-                'pt': '葡萄牙语',
-                'it': '意大利语',
-                'nl': '荷兰语',
-                'pl': '波兰语',
-                'tr': '土耳其语',
-                'vi': '越南语',
-                'th': '泰语',
-                'id': '印尼语',
-                'ms': '马来语'
-            }
-        else:
-            return {}
+        # 组装结果
+        for i, seg in enumerate(segments):
+            initial_trans = final_translations[i]
+            final_text = initial_trans
+            
+            # Step 2: 反思 (逐条处理，因为反思很慢)
+            if use_reflection and self.reflector and len(initial_trans) > 5:
+                final_text = self._reflect_and_improve(seg['text'], initial_trans, target_lang)
+                
+            translated_segments.append({
+                'start': seg['start'],
+                'end': seg['end'],
+                'text': final_text,
+                'original_text': seg['text']
+            })
+            
+        return translated_segments
+
+    def get_supported_languages(self):
+        return {
+            "whisper": ["auto", "en", "zh", "ja", "ko", "fr", "de", "es"],
+            "nmt": ["zh-cn", "en", "ja", "ko", "fr", "de", "es"]
+        }
