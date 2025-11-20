@@ -3,6 +3,9 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 import logging
 import gc
 
+from models.quality_estimator import QualityEstimator
+from config import Config
+
 logger = logging.getLogger(__name__)
 
 class NeuralTranslator:
@@ -37,6 +40,17 @@ class NeuralTranslator:
                 except Exception as e:
                     logger.warning(f"反思模型加载失败，将降级为仅翻译模式: {e}")
                     self.reflector = None
+
+            # 3. 加载 QE 模型 (可选)
+            self.qe_model = None
+            self.qe_threshold = getattr(Config, 'QE_THRESHOLD', 0.7)
+            if getattr(Config, 'ENABLE_QE', False):
+                qe_model_id = getattr(Config, 'QE_MODEL_ID', "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+                try:
+                    self.qe_model = QualityEstimator(model_id=qe_model_id, device=device)
+                except Exception as e:
+                    logger.warning(f"QE 模型加载失败: {e}")
+                    self.qe_model = None
                 
         except Exception as e:
             logger.error(f"核心模型加载失败: {e}")
@@ -154,20 +168,39 @@ class NeuralTranslator:
             batch_results = self._translate_batch(batch_texts, source_lang, target_lang)
             final_translations.extend(batch_results)
             
+        # 批量 QE 评估 (如果启用)
+        qe_scores = []
+        if self.qe_model:
+            logger.info("正在执行批量质量评估 (QE)...")
+            pairs = [[seg['text'], trans] for seg, trans in zip(segments, final_translations)]
+            qe_scores = self.qe_model.estimate_batch(pairs)
+        else:
+            qe_scores = [0.0] * len(segments)
+
         # 组装结果
         for i, seg in enumerate(segments):
             initial_trans = final_translations[i]
             final_text = initial_trans
+            qe_score = qe_scores[i]
             
             # Step 2: 反思 (逐条处理，因为反思很慢)
-            if use_reflection and self.reflector and len(initial_trans) > 5:
-                final_text = self._reflect_and_improve(seg['text'], initial_trans, target_lang)
+            # 只有当启用反思 AND (没有QE模型 OR QE分数低于阈值) 时才反思
+            should_reflect = use_reflection and self.reflector and len(initial_trans) > 5
+            
+            if should_reflect:
+                if self.qe_model and qe_score >= self.qe_threshold:
+                    logger.info(f"QE ({qe_score:.4f}) >= {self.qe_threshold}, 跳过反思: {initial_trans[:30]}...")
+                else:
+                    if self.qe_model:
+                        logger.info(f"QE ({qe_score:.4f}) < {self.qe_threshold}, 触发反思: {initial_trans[:30]}...")
+                    final_text = self._reflect_and_improve(seg['text'], initial_trans, target_lang)
                 
             translated_segments.append({
                 'start': seg['start'],
                 'end': seg['end'],
                 'text': final_text,
-                'original_text': seg['text']
+                'original_text': seg['text'],
+                'qe_score': qe_score # 记录分数以便调试
             })
             
         return translated_segments

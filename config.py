@@ -31,6 +31,13 @@ class Config:
     FINETUNE_EPOCHS = 3
     FINETUNE_LEARNING_RATE = 2e-5
     FINETUNE_BATCH_SIZE = 16
+
+    # 5. Quality Estimation (QE) Model
+    # 使用 Bi-Encoder (Sentence-BERT) 进行翻译质量评估
+    # 模型: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 (更稳定，下载量大)
+    QE_MODEL_ID = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    QE_THRESHOLD = 0.7
+    ENABLE_QE = True
     
     # =====================================================
     
