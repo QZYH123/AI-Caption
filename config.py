@@ -13,7 +13,7 @@ class Config:
 
     # ML Model Configuration
     # 1. Whisper ASR Model
-    WHISPER_MODEL = 'medium'
+    WHISPER_MODEL = 'small'
     WHISPER_DEVICE = 'cuda'  # 若有N卡改为 'cuda'
 
     # 2. NMT Model（新增 TRANSLATOR_DEVICE 配置）
