@@ -204,16 +204,32 @@
                 <div class="glass-panel rounded-2xl p-6 mt-4">
                     <h3 class="font-bold text-white">BLEU 翻译质量评估</h3>
 
+                    <!-- 参考字幕上传 -->
+                    <div class="mt-4">
+                        <input type="file" id="ref-file" accept=".srt" class="text-white" />
+                        <button id="btn-upload-ref"
+                                class="bg-primary mt-2 px-4 py-2 rounded-lg text-white font-bold hover:bg-primary/80">
+                            上传参考字幕
+                        </button>
+                    </div>
+
+                    <!-- 候选字幕（翻译字幕）上传 -->
+                    <div class="mt-4">
+                        <input type="file" id="cand-file" accept=".srt" class="text-white" />
+                        <button id="btn-upload-cand"
+                                class="bg-primary mt-2 px-4 py-2 rounded-lg text-white font-bold hover:bg-primary/80">
+                            上传翻译字幕
+                        </button>
+                    </div>
+
+                    <!-- 评估按钮 -->
                     <button id="btn-evaluate"
-                         class="bg-primary mt-3 px-4 py-2 rounded-lg text-white font-bold hover:bg-primary/80">
+                            class="bg-primary mt-5 px-4 py-2 rounded-lg text-white font-bold hover:bg-primary/80">
                         评估翻译（BLEU）
                     </button>
 
-                    <input type="file" id="ref-file" accept=".srt" />
-                    <button id="btn-upload-ref">上传参考字幕</button>
-
-
-                <div id="bleu-result" class="mt-3 text-accent font-bold text-lg"></div>
+                    <!-- BLEU 显示结果 -->
+                    <div id="bleu-result" class="mt-3 text-accent font-bold text-lg"></div>
                 </div>
             </div>
         </div>
@@ -922,26 +938,12 @@
     }
 });
 
-    document.getElementById("btn-evaluate")?.addEventListener("click", async function () {
-
-    const referencePath = "data/reference.srt";
-
-    if (!window.lastGeneratedSubtitlePath) {
-        alert("请先生成字幕文件再评估 BLEU！");
-        return;
-    }
-
-    const candidatePath = window.lastGeneratedSubtitlePath;
+document.getElementById("btn-evaluate")?.addEventListener("click", async function () {
 
     log("开始 BLEU 翻译质量评估...", "system");
 
     const response = await fetch("/api/evaluate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-            reference_path: referencePath,
-            candidate_path: candidatePath
-        })
+        method: "POST"
     });
 
     const result = await response.json();
@@ -954,12 +956,10 @@
 
     log("BLEU 评估完成！得分：" + result.bleu.score.toFixed(2), "success");
 
-    // 展示 UI（你已经加好了 bleuArea）
-    document.getElementById("bleuArea").classList.remove("hidden");
-    document.getElementById("bleu-result").innerText =
+document.getElementById("bleu-result").innerText =
         "BLEU 得分: " + result.bleu.score.toFixed(2);
-    document.getElementById("bleu-result").classList.remove("hidden");
-    });
+});
+
 
     </script>
 </body>

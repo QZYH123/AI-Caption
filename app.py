@@ -244,16 +244,22 @@ def upload_reference():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
+@app.post("/api/upload-candidate")
+def upload_candidate():
+    try:
+        file = request.files["file"]
+        save_path = os.path.join("data", "candidate.srt")
+        file.save(save_path)
+        return jsonify({"success": True, "message": "候选字幕上传成功！", "path": save_path})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
 
 @app.route('/api/evaluate', methods=['POST'])
 def evaluate_translation():
     try:
-        data = request.get_json()
-        reference_path = data.get('reference_path')
-        candidate_path = data.get('candidate_path')
-
-        if not reference_path or not candidate_path:
-            return jsonify({'error': '缺少 reference_path 或 candidate_path'}), 400
+        reference_path = "data/reference.srt"
+        candidate_path = "data/candidate.srt"
 
         if not os.path.exists(reference_path):
             return jsonify({'error': f'参考文件不存在: {reference_path}'}), 400
@@ -261,7 +267,6 @@ def evaluate_translation():
         if not os.path.exists(candidate_path):
             return jsonify({'error': f'候选翻译文件不存在: {candidate_path}'}), 400
 
-        # 直接把路径传进去，不做任何读取！
         bleu = bleu_evaluator.evaluate(reference_path, candidate_path)
 
         return jsonify({
@@ -272,6 +277,7 @@ def evaluate_translation():
     except Exception as e:
         logger.error(f"BLEU 评估失败: {e}")
         return jsonify({'error': str(e)}), 500
+
 
 
 

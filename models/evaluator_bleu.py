@@ -2,7 +2,6 @@
 
 import os
 import re
-import codecs
 from sacrebleu.metrics import BLEU
 
 class SacreBLEUEvaluator:
@@ -11,41 +10,45 @@ class SacreBLEUEvaluator:
 
     def load_srt(self, path):
         """
-        读取 SRT 文件，并提取字幕文本（不带序号、时间戳）
+        读取 SRT 文件，按句子列表返回，兼容 sacrebleu 格式
         """
         if not os.path.exists(path):
             raise FileNotFoundError(f"文件不存在: {path}")
 
-        with codecs.open(path, 'r', 'utf-8', errors='ignore') as f:
-            content = f.read()
+        lines = []
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
 
-        # 删除序号
-        content = re.sub(r"\n\d+\n", "\n", content)
+                # 跳过序号（独占一行）
+                if re.fullmatch(r"\d+", line):
+                    continue
+                
+                # 跳过时间轴
+                if "-->" in line:
+                    continue
 
-        # 删除时间轴
-        content = re.sub(
-            r"\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}",
-            "",
-            content,
-        )
+                if line:
+                    lines.append(line)
 
-        # 清理空行
-        lines = [line.strip() for line in content.split("\n") if line.strip()]
-        return " ".join(lines)
+        return lines    # 返回列表而不是一个长字符串
 
     def evaluate(self, reference_path, candidate_path):
         """
         计算 BLEU 分数
         """
-        ref = self.load_srt(reference_path)
-        cand = self.load_srt(candidate_path)
+        ref_lines = self.load_srt(reference_path)
+        cand_lines = self.load_srt(candidate_path)
 
-        score_obj = self.metric.corpus_score([cand], [[ref]])
+        # sacrebleu 的格式要求：
+        # hypotheses: List[str]
+        # references: List[List[str]]
+        score_obj = self.metric.corpus_score(cand_lines, [ref_lines])
 
         return {
             "score": score_obj.score,
             "precisions": score_obj.precisions,
             "bp": score_obj.bp,
             "sys_len": score_obj.sys_len,
-            "ref_len": score_obj.ref_len
+            "ref_len": score_obj.ref_len,
         }
