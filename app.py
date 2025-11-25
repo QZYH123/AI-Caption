@@ -2,8 +2,12 @@ from flask import Flask, render_template, request, jsonify, send_file, url_for
 import os
 import json
 import logging
+import shutil
 from datetime import datetime
 from werkzeug.utils import secure_filename
+from models.evaluator_bleu import SacreBLEUEvaluator
+from utils.srt_utils import load_srt_as_sentences
+
 
 # 引入配置
 from config import Config
@@ -55,6 +59,8 @@ try:
     audio_processor = AudioProcessor()
     subtitle_generator = SubtitleGenerator()
     file_handler = FileHandler()
+    bleu_evaluator = SacreBLEUEvaluator()
+    logger.info("BLEU 评估器加载完成")
 
     logger.info("✅ 所有系统组件初始化成功")
 
@@ -92,7 +98,7 @@ def upload_file():
             'success': True,
             'file_path': file_path,
             'filename': filename,
-            'original_name': file.filename
+            'original_name': file.filename,
         })
 
     except Exception as e:
@@ -209,16 +215,70 @@ def generate_subtitle():
         subtitle_path = subtitle_generator.create_subtitle(
             segments, output_path, format_type
         )
+        # 如果生成的是 original 字幕，则自动创建参考字幕
+        if suffix == "original":
+            reference_path = "data/reference.srt"
+            # 仅在用户没有上传自定义 reference 时自动生成
+            if not os.path.exists(reference_path):
+                shutil.copy(subtitle_path, reference_path)
+            logger.info(f"已自动生成参考字幕: {reference_path}")
 
         return jsonify({
             'success': True,
             'download_url': url_for('download_file', filename=output_filename),
-            'filename': output_filename
+            'filename': output_filename,
+            'file_path': subtitle_path   # 给 BLEU           
         })
 
     except Exception as e:
         logger.error(f"字幕文件生成失败: {e}")
         return jsonify({'error': str(e)}), 500
+    
+@app.post("/api/upload-reference")
+def upload_reference():
+    try:
+        file = request.files["file"]
+        save_path = os.path.join("data", "reference.srt")
+        file.save(save_path)
+        return jsonify({"success": True, "message": "参考字幕上传成功！", "path": save_path})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.post("/api/upload-candidate")
+def upload_candidate():
+    try:
+        file = request.files["file"]
+        save_path = os.path.join("data", "candidate.srt")
+        file.save(save_path)
+        return jsonify({"success": True, "message": "候选字幕上传成功！", "path": save_path})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/evaluate', methods=['POST'])
+def evaluate_translation():
+    try:
+        reference_path = "data/reference.srt"
+        candidate_path = "data/candidate.srt"
+
+        if not os.path.exists(reference_path):
+            return jsonify({'error': f'参考文件不存在: {reference_path}'}), 400
+
+        if not os.path.exists(candidate_path):
+            return jsonify({'error': f'候选翻译文件不存在: {candidate_path}'}), 400
+
+        bleu = bleu_evaluator.evaluate(reference_path, candidate_path)
+
+        return jsonify({
+            'success': True,
+            'bleu': bleu
+        })
+
+    except Exception as e:
+        logger.error(f"BLEU 评估失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 
 
 @app.route('/download/<filename>')
