@@ -5,7 +5,8 @@ import gc
 from typing import Optional, Dict, Any, List
 from sentence_transformers import SentenceTransformer, util
 import re
-
+import os
+os.makedirs("offload_nllb", exist_ok=True)
 logger = logging.getLogger(__name__)
 
 
@@ -35,10 +36,12 @@ class NeuralTranslator:
 
             # [注意] transformers 库提示 torch_dtype 已废弃，使用 dtype
             self.nmt_model = AutoModelForSeq2SeqLM.from_pretrained(
-                nmt_model_id,
-                use_safetensors=True,
-                low_cpu_mem_usage=True,
-                dtype=nmt_dtype  # 使用 dtype
+            nmt_model_id,
+            use_safetensors=True,
+            low_cpu_mem_usage=True,
+            dtype=nmt_dtype,
+            device_map="auto",               # 大模型必需
+            offload_folder="offload_nllb",   # 防止显存不够时自动落盘（可选）
             ).to(self.device)
             logger.info("✅ NMT model loaded successfully.")
 
@@ -49,12 +52,15 @@ class NeuralTranslator:
                 reflection_dtype = torch.float16 if self.device.type == 'cuda' else torch.float32
 
                 self.reflector = pipeline(
-                    "text-generation",
-                    model=reflection_model_id,
-                    device=reflector_device_index,
-                    dtype=reflection_dtype,
-                    model_kwargs={"low_cpu_mem_usage": True}
-                )
+                "text-generation",
+                model=reflection_model_id,
+                dtype=torch.float32,
+                device_map="auto",
+                model_kwargs={
+                    "low_cpu_mem_usage": True,
+                    "use_safetensors": True
+                })
+
 
                 # --- 关键修复点/强化点：确保 reflector 的 pad_token 设置稳定 ---
                 if self.reflector.tokenizer.pad_token is None and self.reflector.tokenizer.eos_token is not None:
