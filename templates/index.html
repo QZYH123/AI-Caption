@@ -200,6 +200,37 @@
                         <i id="btnIcon" class="fa-solid fa-bolt"></i>
                     </div>
                 </button>
+
+                <div class="glass-panel rounded-2xl p-6 mt-4">
+                    <h3 class="font-bold text-white">BLEU 翻译质量评估</h3>
+
+                    <!-- 参考字幕上传 -->
+                    <div class="mt-4">
+                        <input type="file" id="ref-file" accept=".srt" class="text-white" />
+                        <button id="btn-upload-ref"
+                                class="bg-primary mt-2 px-4 py-2 rounded-lg text-white font-bold hover:bg-primary/80">
+                            上传参考字幕
+                        </button>
+                    </div>
+
+                    <!-- 候选字幕（翻译字幕）上传 -->
+                    <div class="mt-4">
+                        <input type="file" id="cand-file" accept=".srt" class="text-white" />
+                        <button id="btn-upload-cand"
+                                class="bg-primary mt-2 px-4 py-2 rounded-lg text-white font-bold hover:bg-primary/80">
+                            上传翻译字幕
+                        </button>
+                    </div>
+
+                    <!-- 评估按钮 -->
+                    <button id="btn-evaluate"
+                            class="bg-primary mt-5 px-4 py-2 rounded-lg text-white font-bold hover:bg-primary/80">
+                        评估翻译（BLEU）
+                    </button>
+
+                    <!-- BLEU 显示结果 -->
+                    <div id="bleu-result" class="mt-3 text-accent font-bold text-lg"></div>
+                </div>
             </div>
         </div>
 
@@ -280,8 +311,8 @@
                     </div>
                     </div>
             </div>
-
         </div>
+      </div>
     </main>
 
     <script>
@@ -720,6 +751,216 @@
                 if (id === 'step4') icon.className = 'fa-solid fa-microchip text-xs';
             });
         }
+
+        // 核心流程
+        startBtn.addEventListener('click', async () => {
+            if (isProcessing || !currentFile) return;
+            
+            isProcessing = true;
+            processStartTime = Date.now();
+            startBtn.disabled = true;
+            document.getElementById('btnText').textContent = "处理中...";
+            document.getElementById('btnIcon').className = "fa-solid fa-circle-notch fa-spin";
+            
+            resetSteps();
+            document.getElementById('downloadArea').classList.add('hidden');
+
+            try {
+                // Step 1: Upload
+                updateStep('step1', 'active');
+                log("正在上传文件到服务器...", 'system');
+                
+                const formData = new FormData();
+                formData.append('file', currentFile);
+                
+                const uploadRes = await fetch('/api/upload', { method: 'POST', body: formData });
+                const uploadData = await uploadRes.json();
+                
+                if (!uploadData.success) throw new Error(uploadData.error);
+                
+                log(`上传成功: ${uploadData.filename}`, 'success');
+                updateStep('step1', 'completed');
+
+                // Step 2: Transcribe
+                updateStep('step2', 'active');
+                log("加载 Whisper 模型进行转录...", 'system');
+                
+                const transcribeRes = await fetch('/api/transcribe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        file_path: uploadData.file_path,
+                        language: document.getElementById('sourceLang').value
+                    })
+                });
+                const transcribeData = await transcribeRes.json();
+                
+                if (!transcribeData.success) throw new Error(transcribeData.error);
+                
+                log(`转录完成. 识别到语言: ${transcribeData.language}, 片段数: ${transcribeData.segments.length}`, 'success');
+                updateStep('step2', 'completed');
+
+                // Step 3 & 4: Translate (Integrates Reflection)
+                updateStep('step3', 'active');
+                if (document.getElementById('useReflection').checked) {
+                    updateStep('step4', 'active'); // 同时激活反思步骤UI
+                }
+                
+                log(`启动 NLLB-200 神经翻译 (Target: ${document.getElementById('targetLang').value})...`, 'system');
+                
+                const translateRes = await fetch('/api/translate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        segments: transcribeData.segments,
+                        target_language: document.getElementById('targetLang').value,
+                        source_language: transcribeData.language,
+                        use_reflection: document.getElementById('useReflection').checked
+                    })
+                });
+                const translateData = await translateRes.json();
+                
+                if (!translateData.success) throw new Error(translateData.error);
+                
+                log("翻译与AI反思优化完成", 'success');
+                updateStep('step3', 'completed');
+                updateStep('step4', 'completed');
+
+                // ---------------------------------------------------------
+                // Step 5: 生成双语字幕 (Generate Dual Subtitles)
+                // ---------------------------------------------------------
+                log("正在生成双语字幕文件...", 'system');
+
+                // 1. 生成原文未翻译字幕 (Original)
+                const genOriginalRes = await fetch('/api/generate-subtitle', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        segments: transcribeData.segments, // 原始片段
+                        format: 'srt',
+                        filename: currentFile.name,
+                        suffix: 'original' // 后缀: _original
+                    })
+                });
+                const genOriginalData = await genOriginalRes.json();
+                window.referenceSubtitlePath = genOriginalData.file_path;
+                // 2. 生成已翻译字幕 (Translated)
+                const genTransRes = await fetch('/api/generate-subtitle', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        segments: translateData.segments, // 翻译后片段
+                        format: 'srt',
+                        filename: currentFile.name,
+                        suffix: 'translated' // 后缀: _translated
+                    })
+                });
+                const genTransData = await genTransRes.json();
+                // 保存到全局变量，供 BLEU 评估使用
+                window.candidateSubtitlePath = genTransData.file_path;
+                log("双语字幕文件生成完成", 'success');
+                // ---------------------------------------------------------
+                // 完成与显示 (Finish)
+                // ---------------------------------------------------------
+                const duration = ((Date.now() - processStartTime) / 1000).toFixed(1);
+                // document.getElementById('timeCost').textContent = duration; // 被覆盖了，不需要
+                
+                const downloadArea = document.getElementById('downloadArea');
+                
+                // 创建原文按钮
+                const btnOrg = `
+                    <a href="${genOriginalData.download_url}" class="flex-1 bg-slate-700 hover:bg-slate-600 text-white font-bold py-2.5 px-4 rounded-lg transition flex items-center justify-center gap-2 shadow-lg">
+                        <i class="fa-solid fa-file-lines"></i> 下载原文
+                    </a>`;
+                
+                // 创建译文按钮
+                const btnTrans = `
+                    <a href="${genTransData.download_url}" class="flex-1 bg-accent hover:bg-emerald-400 text-slate-900 font-bold py-2.5 px-4 rounded-lg transition flex items-center justify-center gap-2 shadow-lg shadow-accent/20">
+                        <i class="fa-solid fa-language"></i> 下载译文
+                    </a>`;
+
+                // 替换 HTML 结构
+                downloadArea.innerHTML = `
+                    <div class="flex flex-col gap-4">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <h3 class="font-bold text-white">🎉 处理完成</h3>
+                                <p class="text-xs text-slate-400 mt-1">耗时: <span class="text-accent">${duration}</span>s</p>
+                            </div>
+                        </div>
+                        <div class="flex gap-4">
+                             ${btnOrg}
+                             ${btnTrans}
+                        </div>
+                    </div>
+                `;
+                
+                downloadArea.classList.remove('hidden');
+                log(`🎉 全部流程结束! 原文与译文已生成`, 'success');
+
+            } catch (err) {
+                log(`流程终止: ${err.message}`, 'error');
+                alert(`发生错误: ${err.message}`);
+            } finally {
+                isProcessing = false;
+                startBtn.disabled = false;
+                document.getElementById('btnText').textContent = "开始智能处理";
+                document.getElementById('btnIcon').className = "fa-solid fa-bolt";
+            }
+        });
+
+        // ---------------------------------------------------------
+        // BLEU 评估按钮逻辑
+        // ---------------------------------------------------------
+
+    document.getElementById("btn-upload-ref").addEventListener("click", async () => {
+    const fileInput = document.getElementById("ref-file");
+
+    if (!fileInput.files.length) {
+        alert("请选择一个 reference.srt 文件！");
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append("file", fileInput.files[0]);
+
+    const res = await fetch("/api/upload-reference", {
+        method: "POST",
+        body: formData
+    });
+
+    const data = await res.json();
+
+    if (data.success) {
+        alert("参考字幕上传成功！");
+    } else {
+        alert("上传失败：" + data.error);
+    }
+});
+
+document.getElementById("btn-evaluate")?.addEventListener("click", async function () {
+
+    log("开始 BLEU 翻译质量评估...", "system");
+
+    const response = await fetch("/api/evaluate", {
+        method: "POST"
+    });
+
+    const result = await response.json();
+
+    if (!result.success) {
+        log("BLEU 评估失败：" + result.error, "error");
+        alert("BLEU 评估失败：" + result.error);
+        return;
+    }
+
+    log("BLEU 评估完成！得分：" + result.bleu.score.toFixed(2), "success");
+
+document.getElementById("bleu-result").innerText =
+        "BLEU 得分: " + result.bleu.score.toFixed(2);
+});
+
+
     </script>
 </body>
 

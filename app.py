@@ -2,14 +2,16 @@ from flask import Flask, render_template, request, jsonify, send_file, url_for
 import os
 import json
 import logging
+import shutil
 from datetime import datetime
 from werkzeug.utils import secure_filename
+from models.evaluator_bleu import SacreBLEUEvaluator
+from utils.srt_utils import load_srt_as_sentences
 
 # 引入配置
 from config import Config
 
-# 引入模型组件 (根据新的协调类结构修改)
-# 现在使用 WhisperTranscriber 作为 ASR 和 VLM 协调器
+# 引入模型组件
 from models.whisper_model_fixed import WhisperTranscriber
 from models.translator import NeuralTranslator
 from utils.audio_processor import AudioProcessor
@@ -35,7 +37,6 @@ try:
     logger.info("正在初始化 AI 核心组件...")
 
     # 1. 初始化 Whisper Transcriber (ASR + VLM 协调器)
-    # 该类内部会加载 Whisper 模型和 VLMSceneAnalyzer
     transcriber = WhisperTranscriber(
         model_name=Config.WHISPER_MODEL,
         device=Config.WHISPER_DEVICE
@@ -43,18 +44,23 @@ try:
     logger.info(f"Whisper Transcriber (ASR/VLM Coordinator) 初始化完成。")
 
 
-    # 2. 初始化 NeuralTranslator (NMT + LLM 模型)
+    # 2. 初始化 NeuralTranslator (NMT + LLM 模型 + LoRA)
     translator = NeuralTranslator(
         nmt_model_id=getattr(Config, 'NMT_MODEL_ID', "facebook/nllb-200-distilled-600M"),
         reflection_model_id=getattr(Config, 'REFLECTION_MODEL_ID', "Qwen/Qwen2.5-0.5B-Instruct"),
+        # --- 传递 LoRA 配置 ---
+        lora_model_id=Config.LORA_MODEL_PATH if getattr(Config, 'USE_LORA', False) else None,
+        # -------------------
         device=Config.WHISPER_DEVICE
     )
-    logger.info("神经翻译引擎加载完成 (NLLB + Reflection Agent)")
+    logger.info("神经翻译引擎加载完成 (NLLB + LoRA + Reflection Agent)")
 
     # 3. 初始化工具类
     audio_processor = AudioProcessor()
     subtitle_generator = SubtitleGenerator()
     file_handler = FileHandler()
+    bleu_evaluator = SacreBLEUEvaluator()
+    logger.info("BLEU 评估器加载完成")
 
     logger.info("✅ 所有系统组件初始化成功")
 
@@ -92,7 +98,7 @@ def upload_file():
             'success': True,
             'file_path': file_path,
             'filename': filename,
-            'original_name': file.filename
+            'original_name': file.filename,
         })
 
     except Exception as e:
@@ -116,24 +122,22 @@ def transcribe_audio():
         temp_dir = file_handler.create_temp_directory()
 
         try:
-            # 1. 预处理音频：从视频中提取音频
+            # 1. 预处理音频
             processed_audio_path = audio_processor.process_audio_for_transcription(
                 file_path, temp_dir
             )
 
             # 2. 调用 Whisper Transcriber 协调器
-            # 它将负责：ASR (使用 processed_audio_path) -> VLM (使用 file_path 和时间戳) -> 结果合并
             logger.info("调用 Whisper Transcriber 进行 ASR 和 VLM 协调分析...")
             result = transcriber.transcribe(
                 media_path=processed_audio_path,
                 language=language,
-                video_source_path=file_path  # 传入原始视频路径供 VLM 使用
+                video_source_path=file_path 
             )
 
             segments = result.get('segments', [])
             logger.info(f"协调分析完成，返回 {len(segments)} 个片段。")
 
-            # 组装最终结果
             return jsonify({
                 'success': True,
                 'text': result['text'],
@@ -209,15 +213,66 @@ def generate_subtitle():
         subtitle_path = subtitle_generator.create_subtitle(
             segments, output_path, format_type
         )
+        # 如果生成的是 original 字幕，则自动创建参考字幕
+        if suffix == "original":
+            reference_path = "data/reference.srt"
+            if not os.path.exists(reference_path):
+                shutil.copy(subtitle_path, reference_path)
+            logger.info(f"已自动生成参考字幕: {reference_path}")
 
         return jsonify({
             'success': True,
             'download_url': url_for('download_file', filename=output_filename),
-            'filename': output_filename
+            'filename': output_filename,
+            'file_path': subtitle_path          
         })
 
     except Exception as e:
         logger.error(f"字幕文件生成失败: {e}")
+        return jsonify({'error': str(e)}), 500
+    
+@app.post("/api/upload-reference")
+def upload_reference():
+    try:
+        file = request.files["file"]
+        save_path = os.path.join("data", "reference.srt")
+        file.save(save_path)
+        return jsonify({"success": True, "message": "参考字幕上传成功！", "path": save_path})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.post("/api/upload-candidate")
+def upload_candidate():
+    try:
+        file = request.files["file"]
+        save_path = os.path.join("data", "candidate.srt")
+        file.save(save_path)
+        return jsonify({"success": True, "message": "候选字幕上传成功！", "path": save_path})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/evaluate', methods=['POST'])
+def evaluate_translation():
+    try:
+        reference_path = "data/reference.srt"
+        candidate_path = "data/candidate.srt"
+
+        if not os.path.exists(reference_path):
+            return jsonify({'error': f'参考文件不存在: {reference_path}'}), 400
+
+        if not os.path.exists(candidate_path):
+            return jsonify({'error': f'候选翻译文件不存在: {candidate_path}'}), 400
+
+        bleu = bleu_evaluator.evaluate(reference_path, candidate_path)
+
+        return jsonify({
+            'success': True,
+            'bleu': bleu
+        })
+
+    except Exception as e:
+        logger.error(f"BLEU 评估失败: {e}")
         return jsonify({'error': str(e)}), 500
 
 
