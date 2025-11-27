@@ -41,6 +41,10 @@ class Config:
     SUBTITLE_FORMATS = ['srt', 'vtt']
     TEMP_FOLDER = 'temp'
 
+    # LoRA 微调模型配置（新增）
+    USE_LORA = True  # 设为 False 可回退到基础模型
+    LORA_MODEL_PATH = "models/lora_nllb_terminology"
+
     @staticmethod
     def init_app(app):
         os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)

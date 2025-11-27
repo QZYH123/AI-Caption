@@ -9,7 +9,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # 修复：使用相对导入以确保在 models 包结构中能够正确找到 VLMSceneAnalyzer
 try:
-    from .vlm_analyzer import VLMSceneAnalyzer
+    from models.vlm_analyzer import VLMSceneAnalyzer
 except ImportError:
     # 仅在 VLM 模块未找到时记录警告，以便 Whisper 仍能运行（非视频文件场景）
     logging.warning("VLMSceneAnalyzer module not found. Video analysis will be skipped.")
